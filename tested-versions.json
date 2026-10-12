@@ -53,6 +53,14 @@
       "runtime": "0.0.27/20260927214556-b77d38801cca",
       "lcu_version": "0.7.0",
       "evidence": "docs/releases/0.7.0.md"
+    },
+    {
+      "platform": "darwin",
+      "architecture": "arm64",
+      "app_version": "26.1007.30912",
+      "runtime": "0.0.29/20261005054403-144090e2ddcb",
+      "lcu_version": "0.11.2",
+      "evidence": "docs/verification/macos-chatgpt-26.1007-2026-10-12.md"
     }
   ]
 }
