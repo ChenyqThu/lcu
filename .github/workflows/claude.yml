@@ -34,3 +34,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # actions:read on the app token (GH_TOKEN) so `gh run view` can read CI logs.
+          additional_permissions: |
+            actions: read
+          # Tag mode only pre-allows Read/Glob/Grep/LS, git and its comment/CI MCP tools;
+          # anything else is denied in headless runs. Allow web access and read-only gh.
+          claude_args: |
+            --allowedTools "WebSearch,WebFetch"
+            --allowedTools "Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr list:*),Bash(gh run view:*),Bash(gh run list:*),Bash(gh repo view:*),Bash(gh release view:*),Bash(gh release list:*),Bash(gh api:*)"
