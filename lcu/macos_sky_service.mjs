@@ -1,5 +1,7 @@
-// Forward the original Sky service unchanged and relay its original lifecycle
-// hook to the signed macOS client through an LCU-owned, short-lived socket.
+// Forward the original Sky service unchanged except for type_text lines with
+// characters the native keyboard path drops, which go to the original
+// policy-checked paste, and relay its original lifecycle hook to the signed
+// macOS client through an LCU-owned, short-lived socket.
 import {pathToFileURL} from 'node:url';
 import {Buffer} from 'node:buffer';
 
@@ -187,10 +189,13 @@ function register() {
     const {session_id, turn_id} = event ?? {};
     if (typeof session_id !== 'string' || !session_id.trim() ||
         typeof turn_id !== 'string' || !turn_id.trim()) {
+      // An unattributed turn end stops every segmented request.
+      for (const listener of turnEndListeners) listener(undefined);
       throw Error('Original node_repl turn IDs are missing');
     }
     endControlTurn(session_id, turn_id);
     const key = JSON.stringify([session_id, turn_id]);
+    for (const listener of turnEndListeners) listener(key);
     const item = pendingCleanup.get(key) ?? {
       key, session_id, turn_id,
       metadata: turnMetadata.get(key),
@@ -522,6 +527,49 @@ async function gateOnCleanup() {
   } while ([...pendingCleanup.values()].some(item => item.metadata && !item.nativeNotified));
 }
 
+// The original macOS type_text types each character as one key of the active
+// layout and silently drops characters it has no key for (Korean, emoji, ñ on
+// AZERTY; openai/codex#27494). Split such text at control characters: control
+// runs (Return, Tab, CRLF) stay original type_text so they act as keys, and
+// each chunk between them goes whole to the original paste as plain text if
+// it has a code point above 127, else to type_text. A grapheme cluster never
+// spans a control character, so no character is split. Lone surrogates are
+// passed on unchanged, as the original would receive them. Returns undefined
+// when the request is not adapted.
+function unicodeTextSegments(request) {
+  if (request?.type !== 'execute' || request.method !== 'type_text' ||
+      !Array.isArray(request.args) || request.args.length < 1) return undefined;
+  const input = request.args[0];
+  if (!input || typeof input !== 'object') return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  // Leave invalid accessor inputs to the original app-policy validator; never
+  // evaluate an accessor while adapting a request in the trusted worker.
+  if (Object.values(descriptors).some(property => !('value' in property))) return undefined;
+  const text = descriptors.text?.value;
+  if (typeof text !== 'string' || !/[^\0-\x7f]/.test(text)) return undefined;
+  const runs = [];
+  for (const chunk of text.split(/([\x00-\x1f\x7f]+)/)) {
+    if (!chunk) continue;
+    const paste = /[^\0-\x7f]/.test(chunk);
+    // Adjacent typed chunks (a line and the Return after it) are one type_text.
+    if (!paste && runs.at(-1)?.paste === false) runs.at(-1).text += chunk;
+    else runs.push({paste, text: chunk});
+  }
+  // Each segment keeps the caller's descriptors and any further arguments with
+  // only text replaced (and the plain-text format added for paste); the
+  // caller's request is unchanged.
+  return runs.map(({paste, text}) => {
+    const segment = {...descriptors, text: {...descriptors.text, value: text}};
+    if (paste) segment.format = {value: 'text', enumerable: true};
+    return {...request, method: paste ? 'paste' : 'type_text',
+      args: [Object.defineProperties({}, segment), ...request.args.slice(1)]};
+  });
+}
+
+// Segmented requests run one at a time, so two of them never interleave.
+let segmentQueue = Promise.resolve();
+const turnEndListeners = new Set();
+
 export async function handleRpc(request) {
   register();
   const runtime = globalThis.nodeRepl;
@@ -530,6 +578,12 @@ export async function handleRpc(request) {
   const startedAt = turnsEnded;
   const turnsActive = () => turnsEnded === startedAt;
   const state = {recoveryError: undefined, resent: false};
+  // Turns that ended since a segmented request started, recorded from the start so
+  // its own turn's end is seen whenever it happens.
+  const segments = unicodeTextSegments(request);
+  const endedTurns = new Set();
+  const listener = key => endedTurns.add(key);
+  if (segments) turnEndListeners.add(listener);
   const retryIfActive = async error => {
     // Each recovery restarts "nothing sent since": only a send after it sets `resent` again.
     state.recoveryError = error;
@@ -566,17 +620,49 @@ export async function handleRpc(request) {
     // Checked with no wait before the dispatch below.
     if (blocked()) throw state.recoveryError;
     // The retry, like any request, first waits for pending turn cleanup.
-    return await withStaleServiceRecovery(runtime, () => {
+    const dispatch = segment => withStaleServiceRecovery(runtime, () => {
       if (state.recoveryError) state.resent = true;
-      return service.handleRpc(request);
+      return service.handleRpc(segment);
     }, async error => {
       if (!(await retryIfActive(error))) return false;
       await gateOnCleanup();
       return turnsActive();
     });
+    if (!segments) return await dispatch(request);
+    // Segments are sent in order, each with its own stale-service recovery. The recovery
+    // error is raised while opening the native pipe, before the segment's action is written,
+    // so its single retry resends only that segment, never an earlier delivered one. The
+    // state stays per request: each recovery clears `resent` and any later send sets it,
+    // so after a turn end the recovery error is returned only if nothing was sent since.
+    // When this request's own turn ends (Stop or Interrupt), no further segment is sent;
+    // other turns, such as a subagent's, do not stop it, except that a stale-service retry
+    // is refused after any turn end, as for every request. Without turn metadata any turn
+    // end stops it. A segment sent after another turn ended first waits for that turn's
+    // cleanup, as a new request would; every cleanup queued since this request started went through the
+    // hook, which recorded it in `endedTurns`, and earlier ones were waited for above. Any
+    // segment error ends the sequence without a lossy fallback.
+    const ownKey = metadata && JSON.stringify([metadata.session_id, metadata.turn_id]);
+    const stopped = () => ownKey ? endedTurns.has(ownKey) || endedTurns.has(undefined) : !turnsActive();
+    const run = segmentQueue.then(async () => {
+      let result;
+      const stop = () => Error('macOS text input stopped: the turn ended before every segment was sent');
+      for (const segment of segments) {
+        if (stopped()) throw stop();
+        if (endedTurns.size) {
+          await withStaleServiceRecovery(runtime, gateOnCleanup, retryIfActive);
+          if (stopped()) throw stop();
+        }
+        result = await dispatch(segment);
+      }
+      return result;
+    });
+    segmentQueue = run.catch(() => {});
+    return await run;
   } catch (error) {
     // A turn end after a recovery, with nothing sent since, returns the error that led to the
     // recovery whatever failed later; a retry that was sent fails with its own error.
     throw state.recoveryError && !turnsActive() && !state.resent ? state.recoveryError : error;
+  } finally {
+    turnEndListeners.delete(listener);
   }
 }
